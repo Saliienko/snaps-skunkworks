@@ -4,15 +4,17 @@ import pump from 'pump';
 import { ObservableStore } from '@metamask/obs-store';
 import SafeEventEmitter from '@metamask/safe-event-emitter';
 import ObjectMultiplex from '@metamask/object-multiplex';
-import { WorkerParentPostMessageStream } from '@mm-snap/post-message-stream';
+import { WorkerParentPostMessageStream } from '@metamask/post-message-stream';
 import { PLUGIN_STREAM_NAMES } from '@mm-snap/workers';
+import { createStreamMiddleware } from 'json-rpc-middleware-stream';
 import { PluginData } from '@mm-snap/types';
-
 import {
-  CommandEngine,
-  CommandRequest,
-  CommandResponse,
-} from './CommandEngine';
+  JsonRpcEngine,
+  JsonRpcRequest,
+  JsonRpcResponse,
+} from 'json-rpc-engine';
+
+let id = 0;
 
 export type SetupWorkerConnection = (metadata: any, stream: Duplex) => void;
 
@@ -30,11 +32,11 @@ interface WorkerStreams {
   _connection: WorkerParentPostMessageStream;
 }
 
-// { id: workerId, streams, commandEngine, worker }
 interface WorkerWrapper {
-  id: string;
+  workerId: string;
   streams: WorkerStreams;
-  commandEngine: CommandEngine;
+  rpcEngine: JsonRpcEngine;
+  rpcEngineStream: Duplex;
   worker: Worker;
 }
 
@@ -81,14 +83,11 @@ export class WorkerController extends SafeEventEmitter {
     this.store.updateState({ workers: newWorkerState });
   }
 
-  async command(
-    workerId: string,
-    message: CommandRequest,
-    timeout?: number,
-  ): Promise<CommandResponse> {
+  async command(workerId: string, message: JsonRpcRequest<any>): Promise<any> {
     if (typeof message !== 'object') {
       throw new Error('Must send object.');
     }
+    console.log('command worker', workerId, message);
 
     const workerObj = this.workers.get(workerId);
     if (!workerObj) {
@@ -96,8 +95,11 @@ export class WorkerController extends SafeEventEmitter {
     }
 
     console.log('Parent: Sending Command', message);
-
-    return await workerObj.commandEngine.command(message, timeout);
+    const response: any = await workerObj.rpcEngine.handle(message);
+    if (response.error) {
+      throw new Error(response.error.message);
+    }
+    return response.result;
   }
 
   terminateAll(): void {
@@ -134,7 +136,7 @@ export class WorkerController extends SafeEventEmitter {
   async startPlugin(
     workerId: string,
     pluginData: PluginData,
-  ): Promise<CommandResponse> {
+  ): Promise<JsonRpcResponse<any>> {
     const _workerId: string = workerId || this.workers.keys().next()?.value();
     if (!_workerId) {
       throw new Error('No workers available.');
@@ -143,8 +145,10 @@ export class WorkerController extends SafeEventEmitter {
     this._mapPluginAndWorker(pluginData.pluginName, workerId);
 
     return await this.command(_workerId, {
-      command: 'installPlugin',
-      data: pluginData,
+      jsonrpc: '2.0',
+      method: 'installPlugin',
+      params: pluginData,
+      id: id++, // eslint-disable-line
     });
   }
 
@@ -188,15 +192,37 @@ export class WorkerController extends SafeEventEmitter {
     console.log('_initWorker');
 
     const workerId = nanoid();
+    console.log('workerid', workerId, typeof workerId);
     const worker = new Worker(this.workerUrl, { name: workerId });
     const streams = this._initWorkerStreams(worker, workerId, metadata);
-    const commandEngine = new CommandEngine({
-      workerId,
-      commandStream: streams.command,
-    });
+    const rpcEngine = new JsonRpcEngine();
 
-    this._setWorker(workerId, { id: workerId, streams, commandEngine, worker });
-    await this.command(workerId, { command: 'ping' });
+    const jsonRpcConnection = createStreamMiddleware();
+    rpcEngine.push(jsonRpcConnection.middleware);
+
+    // client side stream
+    const clientSideStream = jsonRpcConnection.stream;
+
+    // clientSideStream.pipe(streams.command).pipe(clientSideStream);
+
+    // streams.command.pipe(clientSideStream).pipe(streams.command);
+
+    // pump(streams.command, stream, streams.command);
+    pump(jsonRpcConnection.stream, streams.command, jsonRpcConnection.stream);
+    // pump(streams.command, jsonRpcConnection.stream, streams.command);
+
+    this._setWorker(workerId, {
+      workerId,
+      streams,
+      rpcEngine,
+      rpcEngineStream: clientSideStream,
+      worker,
+    });
+    await this.command(workerId, {
+      jsonrpc: '2.0',
+      method: 'ping',
+      id: id++, // eslint-disable-line
+    });
     return workerId;
   }
 
